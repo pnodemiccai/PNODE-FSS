@@ -1,3 +1,7 @@
+from cleverhans.torch.attacks.fast_gradient_method import fast_gradient_method as FGSM
+from cleverhans.torch.attacks.projected_gradient_descent import projected_gradient_descent as PGD
+
+
 """Training Script"""
 import os
 import shutil
@@ -19,15 +23,15 @@ from config import ex
 from util.utils import set_seed, CLASS_LABELS, date
 from dataloaders_medical.prostate import *
 from models.fewshot import FewShotSeg
-from models.ode import FewShotSegOde
 from tqdm import tqdm
-from attacks import perturb_adv
+
+
 
 def overlay_color(img, mask, label, scale=50):
     """
-    :param img: [1, 224, 224]
-    :param mask: [1, 224, 224]
-    :param label: [1, 224, 224]
+    :param img: [1, 256, 256]
+    :param mask: [1, 256, 256]
+    :param label: [1, 256, 256]
     :return:
     """
     # pdb.set_trace()
@@ -63,17 +67,11 @@ def main(_run, _config, _log):
 
 
     _log.info('###### Create model ######')
-    _config["model"]["adversarial_train"] = _config["adversarial_train"]
-    if _config["use_ode"]:
-        model_orig = FewShotSegOde(pretrained_path=_config['path']['init_path'], cfg=_config['model'], pretrained_ode=_config["pretrain_ode"], ode_layers=_config["ode_layers"], ode_time=_config["ode_time"])
-    else:
-        model_orig = FewShotSeg(pretrained_path=_config['path']['init_path'], cfg=_config['model'])
-    no_parameters = sum(p.numel() for p in model_orig.parameters())
-    print("no. of paramerters", no_parameters)
-    with open("model_params.txt", "a") as f:
-        f.write("{} | {} parameters\n".format(_config["model_name"], no_parameters))
-    model = nn.DataParallel(model_orig.cuda(), device_ids=[_config['gpu_id'],])
+    model = FewShotSeg(pretrained_path=_config['path']['init_path'], cfg=_config['model'])
+    model = nn.DataParallel(model.cuda(), device_ids=[_config['gpu_id'],])
     model.train()
+    # summary(model, (1, 224, 224), (1, 224, 224), (1, 224, 224), (1, 224, 224))
+    print("Resnet18 | Model Parameters: ", sum(dict((p.data_ptr(), p.numel()) for p in model.parameters()).values()))
 
 
     _log.info('###### Load data ######')
@@ -99,6 +97,37 @@ def main(_run, _config, _log):
     scheduler = MultiStepLR(optimizer, milestones=_config['lr_milestones'], gamma=0.1)
     criterion = nn.CrossEntropyLoss(ignore_index=_config['ignore_label'])
 
+    # q_x = perturb(s_xs, s_y_fgs, s_y_bgs, q_x, q_y_orig)
+
+    def perturb(s_x, s_y_fg, s_y_bg, q_x, y, to_attack="q"):
+        def wrapper_fn(model):
+            def fun(x):
+                nonlocal q_x, s_x
+                if to_attack == "s":
+                    s_x_loc = x
+                    q_x_loc = q_x
+                else:
+                    q_x_loc = x
+                    s_x_loc = s_x
+                s_x = s_x_loc
+                q_x = q_x_loc
+
+                s_xs = [[s_x[:,shot, ...] for shot in range(_config["n_shot"])]]
+                s_y_fgs = [[s_y_fg[:,shot, ...] for shot in range(_config["n_shot"])]]
+                s_y_bgs = [[s_y_bg[:,shot, ...] for shot in range(_config["n_shot"])]]
+                q_xs = [q_x]
+                return model(s_xs, s_y_fgs, s_y_bgs, q_xs)[0]
+            return fun
+        if to_attack == "s":
+            x = s_x
+        else:
+            x = q_x
+        local_model = wrapper_fn(model)
+        epsilon = 0.04
+        x = FGSM(local_model, x, epsilon, np.inf, y=y.view(-1, y.shape[-2], y.shape[-1]).to(torch.long))
+        x = x.detach()
+        return x
+
     if _config['record']:  ## tensorboard visualization
         _log.info('###### define tensorboard writer #####')
         _log.info(f'##### board/train_{_config["board"]}_{date()}')
@@ -108,79 +137,76 @@ def main(_run, _config, _log):
     _log.info('###### Training ######')
     total_iter = len(trainloader)
     for i_iter, sample_batched in enumerate(tqdm(trainloader)):
+
         # Prepare input
-        # print("adversarial perturbation factor {} ".format(factor))
-
-        s_y_fg_orig = sample_batched['s_y'].cuda()  # [B, Support, slice_num, 1, 224, 224]
-        if _config["model"]["adversarial_train"]:
-            s_y_fg_orig = torch.cat([s_y_fg_orig for i in range(factor)], dim=1)
-        s_y_fg = s_y_fg_orig.squeeze(2) # [B, Support, 1, 224, 224]
-        s_y_fg = s_y_fg.squeeze(2) # [B, Support, 224, 224]
+        s_x_orig = sample_batched['s_x'].cuda()  # [B, Support, slice_num=1, 1, 256, 256]
+        s_x = s_x_orig.squeeze(2) # [B, Support, 1, 256, 256]
+        s_y_fg_orig = sample_batched['s_y'].cuda()  # [B, Support, slice_num, 1, 256, 256]
+        s_y_fg = s_y_fg_orig.squeeze(2) # [B, Support, 1, 256, 256]
+        s_y_fg = s_y_fg.squeeze(2) # [B, Support, 256, 256]
         s_y_bg = torch.ones_like(s_y_fg) - s_y_fg
+        q_x_orig = sample_batched['q_x'].cuda()  # [B, slice_num, 1, 256, 256]
+        q_x = q_x_orig.squeeze(1) # [B, 1, 256, 256]
+        q_y_orig = sample_batched['q_y'].cuda()  # [B, slice_num, 1, 256, 256]
+        q_y = q_y_orig.squeeze(1) # [B, 1, 256, 256]
+        q_y = q_y.squeeze(1).long() # [B, 256, 256]
+
+        # perturb here
         
-        q_x_orig = sample_batched['q_x'].cuda()  # [B, slice_num, 1, 224, 224]
-        q_x = q_x_orig.squeeze(1) # [B, 1, 224, 224]
-        # q_x = perturb_adv(q_x, model_orig.encoder, method = _config["attack"])
-        q_y_orig = sample_batched['q_y'].cuda()  # [B, slice_num, 1, 224, 224]
-        # q_y_orig = torch.cat([q_y_orig for i in range(6)], dim=2)
-        q_y = q_y_orig.squeeze(1) # [B, 1, 224, 224]
-        q_y = q_y.squeeze(1).long() # [B, 224, 224]
-        # q_y = torch.cat([q_y for i in range(6)], dim=0)
-        # q_y = torch.cat([q_y for i in range(2)], dim=0)
-        s_xs = [[s_x[:,shot, ...] for shot in range(_config["n_shot"])]]
-        s_y_fgs = [[s_y_fg[:,shot, ...] for shot in range(_config["n_shot"])]]
-        s_y_bgs = [[s_y_bg[:,shot, ...] for shot in range(_config["n_shot"])]]
-        q_xs = [q_x[:, i:i+1, :, :] for i in range(q_x.shape[1])]
+        perturbed_q = perturb(s_x.clone().detach(), s_y_fg, s_y_bg, q_x.clone().detach(), q_y, to_attack="q")
+        perturbed_s = perturb(s_x.clone().detach(), s_y_fg, s_y_bg, q_x.clone().detach(), q_y, to_attack="s")
 
+        to_train_batches = [(q_x, s_x), (q_x, perturbed_s), (perturbed_q, s_x)]
+        # to_train_batches = [(q_x, s_x)]
         
-        # with open('query_support_train.txt', 'a') as f:
-        #     f.write("Query Set: " + str(sample_batched['q_fname']))
-        #     f.write("Support Set: " + str(sample_batched['s_fname']))
-        #     f.write("="*60)
-        """
-        Args:
-            supp_imgs: support images
-                way x shot x [B x 1 x H x W], list of lists of tensors
-            fore_mask: foreground masks for support images
-                way x shot x [B x H x W], list of lists of tensors
-            back_mask: background masks for support images
-                way x shot x [B x H x W], list of lists of tensors
-            qry_imgs: query images
-                N x [B x 1 x H x W], list of tensors
-            qry_pred: [B, 2, H, W]
-        """
+        for q_x, s_x in to_train_batches:
 
-        # Forward and Backward
-        optimizer.zero_grad()
-        query_pred, align_loss, sim_adv = model(s_xs, s_y_fgs, s_y_bgs, q_xs, factor) #[B, 2, w, h]
-        query_loss = criterion(query_pred, q_y)
 
-        if _config["weighting"] == "linear":
-            sim_weight = (i_iter/total_iter) * (1/20)
-        elif _config["weighting"] == "sqrt":
-            sim_weight = np.sqrt(i_iter/total_iter) * (1/20)
-        else:
-            sim_weight = 1
-        loss = query_loss + align_loss * _config['align_loss_scaler'] - sim_adv * sim_weight
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+            s_xs = [[s_x[:,shot, ...] for shot in range(_config["n_shot"])]]
+            s_y_fgs = [[s_y_fg[:,shot, ...] for shot in range(_config["n_shot"])]]
+            s_y_bgs = [[s_y_bg[:,shot, ...] for shot in range(_config["n_shot"])]]
+            q_xs = [q_x]
 
-        # Log loss
-        query_loss = query_loss.detach().data.cpu().numpy()
-        align_loss = align_loss.detach().data.cpu().numpy() if align_loss != 0 else 0
-        if _config["adversarial_train"]:
-            sim_adv = sim_adv.detach().data.cpu().numpy()
-        _run.log_scalar('loss', query_loss)
-        _run.log_scalar('align_loss', align_loss)
-        log_loss['loss'] += query_loss
-        log_loss['align_loss'] += align_loss
+            
+            # with open('query_support_train.txt', 'a') as f:
+            #     f.write("Query Set: " + str(sample_batched['q_fname']))
+            #     f.write("Support Set: " + str(sample_batched['s_fname']))
+            #     f.write("="*60)
+            """
+            Args:
+                supp_imgs: support images
+                    way x shot x [B x 1 x H x W], list of lists of tensors
+                fore_mask: foreground masks for support images
+                    way x shot x [B x H x W], list of lists of tensors
+                back_mask: background masks for support images
+                    way x shot x [B x H x W], list of lists of tensors
+                qry_imgs: query images
+                    N x [B x 1 x H x W], list of tensors
+                qry_pred: [B, 2, H, W]
+            """
 
-        # print loss and take snapshots
+            # Forward and Backward
+            optimizer.zero_grad()
+            query_pred, align_loss, _ = model(s_xs, s_y_fgs, s_y_bgs, q_xs) #[B, 2, w, h]
+            query_loss = criterion(query_pred, q_y)
+            loss = query_loss + align_loss * _config['align_loss_scaler']
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            # Log loss
+            query_loss = query_loss.detach().data.cpu().numpy()
+            align_loss = align_loss.detach().data.cpu().numpy() if align_loss != 0 else 0
+            _run.log_scalar('loss', query_loss)
+            _run.log_scalar('align_loss', align_loss)
+            log_loss['loss'] += query_loss
+            log_loss['align_loss'] += align_loss
+
+            # print loss and take snapshots
         if (i_iter + 1) % _config['print_interval'] == 0:
             loss = log_loss['loss'] / (i_iter + 1)
             align_loss = log_loss['align_loss'] / (i_iter + 1)
-            print(f'step {i_iter+1}/{total_iter}: loss: {loss}, align_loss: {align_loss}, adversarial similarity {sim_adv}')
+            print(f'step {i_iter+1}/{total_iter}: loss: {loss}, align_loss: {align_loss}')
 
             if _config['record']:
                 batch_i = 0
@@ -194,12 +220,7 @@ def main(_run, _config, _log):
 
             print(f"train - iter:{i_iter} \t => model saved", end='\n')
             save_fname = f'{_run.observers[0].dir}/snapshots/last.pth'
-            if _config["adversarial_train"]:
-                model_dir = "./model_weights_adversarial"
-            elif _config["use_ode"]:
-                model_dir = "./model_weights_ode"
-            else:
-                model_dir = "./model_weights_adversarial"
             torch.save(model.state_dict(),save_fname)
-            os.makedirs(model_dir, exist_ok=True)
-            torch.save(model.state_dict(), model_dir + "/{}_tar{}.pth".format(_config["model_name"], _config["target"]))
+            os.makedirs("model_weights_adv_miccai", exist_ok=True)
+            torch.save(model.state_dict(), "./model_weights_adv_miccai/{}.pth".format(_config["model_name"]))
+            
