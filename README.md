@@ -21,6 +21,8 @@ pip install -r requirements.txt
 
 Change the paths to BCV, CT-ORG and Decathlon datasets in  `config.py` and  `test_config.py` according to paths on your local. Also change the path to ImageNet pretrained VGG model weights in these files.
 
+Trained model weights for PNODE, AT-PANet and all baselines on relevant settings can be found [here](https://drive.google.com/drive/folders/1q6ksoDqHKUf6MmksHqCsABtKvdK9btpM?usp=sharing).
+
 ## Training
 
 To train baseline methods, go to their respective folders and run
