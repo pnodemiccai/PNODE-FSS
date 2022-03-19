@@ -23,6 +23,8 @@ Change the paths to BCV, CT-ORG and Decathlon datasets in  `config.py` and  `tes
 
 Trained model weights for PNODE, AT-PANet and all baselines on relevant settings can be found [here](https://drive.google.com/drive/folders/1q6ksoDqHKUf6MmksHqCsABtKvdK9btpM?usp=sharing).
 
+Processed datasets of BCV, CT-ORG and Decathlon can be downloaded from [here](https://drive.google.com/drive/folders/1lvnV0XVluyHm2NZAUecYknpaxbzD2nNo?usp=sharing).
+
 ## Training
 
 To train baseline methods, go to their respective folders and run
